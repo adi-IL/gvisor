@@ -445,6 +445,7 @@ go_test(
     srcs = [
         "fd_table_test.go",
         "table_test.go",
+        "task_syscall_benchmark_test.go",
         "task_test.go",
         "timekeeper_test.go",
     ],
@@ -460,9 +461,12 @@ go_test(
         "//pkg/sentry/kernel/sched",
         "//pkg/sentry/limits",
         "//pkg/sentry/pgalloc",
+        "//pkg/sentry/seccheck",
+        "//pkg/sentry/seccheck/points:points_go_proto",
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/sync",
+        "@org_golang_google_protobuf//proto:go_default_library",
     ],
 )
