@@ -44,7 +44,9 @@ func (e *endpoint) beforeSave() {
 	e.stack.RegisterResumableEndpoint(e)
 }
 
-// Restore implements tcpip.RestoredEndpoint.Restore.
+// Restore implements stack.RestoredEndpoint.Restore.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) Restore(s *stack.Stack) {
 	e.mu.Lock()
 	defer e.mu.Unlock()

@@ -76,17 +76,25 @@ type endpoint struct {
 	rcvClosed  bool
 
 	lastErrorMu sync.Mutex `state:"nosave"`
-	lastError   tcpip.Error
 
-	// The following fields are protected by the mu mutex.
-	mu        sync.RWMutex `state:"nosave"`
+	// +checklocks:lastErrorMu
+	lastError tcpip.Error
+
+	// mu protects the endpoint's port and binding state and readShutdown.
+	mu sync.RWMutex `state:"nosave"`
+
+	// +checklocks:mu
 	portFlags ports.Flags
 
-	// Values used to reserve a port or register a transport endpoint.
-	// (which ever happens first).
+	// Values used to reserve a port or register a transport endpoint,
+	// whichever happens first.
+	//
+	// +checklocks:mu
 	boundBindToDevice tcpip.NICID
-	boundPortFlags    ports.Flags
+	// +checklocks:mu
+	boundPortFlags ports.Flags
 
+	// +checklocks:mu
 	readShutdown bool
 
 	// effectiveNetProtos contains the network protocols actually in use. In
@@ -95,13 +103,17 @@ type endpoint struct {
 	// protocols (e.g., IPv6 and IPv4) or a single different protocol (e.g.,
 	// IPv4 when IPv6 endpoint is bound or connected to an IPv4 mapped
 	// address).
+	//
+	// +checklocks:mu
 	effectiveNetProtos []tcpip.NetworkProtocolNumber
 
 	// frozen indicates if the packets should be delivered to the endpoint
 	// during restore.
 	frozen bool
 
-	localPort  uint16
+	// +checklocks:mu
+	localPort uint16
+	// +checklocks:mu
 	remotePort uint16
 }
 
@@ -135,6 +147,9 @@ func (e *endpoint) WakeupWriters() {
 	e.net.MaybeSignalWritable()
 }
 
+// LastError implements tcpip.SocketOptionsHandler.
+//
+// +checklocksexclude:e.lastErrorMu
 func (e *endpoint) LastError() tcpip.Error {
 	e.lastErrorMu.Lock()
 	defer e.lastErrorMu.Unlock()
@@ -145,6 +160,8 @@ func (e *endpoint) LastError() tcpip.Error {
 }
 
 // UpdateLastError implements tcpip.SocketOptionsHandler.
+//
+// +checklocksexclude:e.lastErrorMu
 func (e *endpoint) UpdateLastError(err tcpip.Error) {
 	e.lastErrorMu.Lock()
 	e.lastError = err
@@ -152,12 +169,16 @@ func (e *endpoint) UpdateLastError(err tcpip.Error) {
 }
 
 // Abort implements stack.TransportEndpoint.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) Abort() {
 	e.Close()
 }
 
 // Close puts the endpoint in a closed state and frees all resources
 // associated with it.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) Close() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -214,6 +235,8 @@ func (e *endpoint) closeLocked() {
 func (*endpoint) ModerateRecvBuf(int) {}
 
 // Read implements tcpip.Endpoint.
+//
+// +checklocksexclude:e.lastErrorMu
 func (e *endpoint) Read(dst io.Writer, opts tcpip.ReadOptions) (tcpip.ReadResult, tcpip.Error) {
 	if err := e.LastError(); err != nil {
 		return tcpip.ReadResult{}, err
@@ -350,9 +373,11 @@ func (e *endpoint) prepareForWriteInner(to *tcpip.FullAddress) (retry bool, err 
 
 var _ tcpip.EndpointWithPreflight = (*endpoint)(nil)
 
-// Validates the passed WriteOptions and prepares the endpoint for writes
+// Preflight validates the passed WriteOptions and prepares the endpoint for writes
 // using those options. If the endpoint is unbound and the `To` address
 // is specified, binds the endpoint to that address.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) Preflight(opts tcpip.WriteOptions) tcpip.Error {
 	var r bytes.Reader
 	udpInfo, err := e.prepareForWrite(&r, opts)
@@ -364,6 +389,9 @@ func (e *endpoint) Preflight(opts tcpip.WriteOptions) tcpip.Error {
 
 // Write writes data to the endpoint's peer. This method does not block
 // if the data cannot be written.
+//
+// +checklocksexclude:e.mu
+// +checklocksexclude:e.lastErrorMu
 func (e *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcpip.Error) {
 	n, err := e.write(p, opts)
 	switch err.(type) {
@@ -385,6 +413,7 @@ func (e *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 	return n, err
 }
 
+// +checklocksexclude:e.mu
 func (e *endpoint) prepareForWrite(p tcpip.Payloader, opts tcpip.WriteOptions) (udpPacketInfo, tcpip.Error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -445,17 +474,13 @@ func (e *endpoint) prepareForWrite(p tcpip.Payloader, opts tcpip.WriteOptions) (
 	}, nil
 }
 
+// +checklocksexclude:e.mu
+// +checklocksexclude:e.lastErrorMu
 func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcpip.Error) {
-	// Do not hold lock when sending as loopback is synchronous and if the UDP
-	// datagram ends up generating an ICMP response then it can result in a
-	// deadlock where the ICMP response handling ends up acquiring this endpoint's
-	// mutex using e.mu.RLock() in endpoint.HandleControlPacket which can cause a
-	// deadlock if another caller is trying to acquire e.mu in exclusive mode w/
-	// e.mu.Lock(). Since e.mu.Lock() prevents any new read locks to ensure the
-	// lock can be eventually acquired.
-	//
-	// See: https://golang.org/pkg/sync/#RWMutex for details on why recursive read
-	// locking is prohibited.
+	// prepareForWrite releases e.mu before sending. Loopback delivery is
+	// synchronous, so an ICMP response can reenter onICMPError, which takes
+	// e.mu.RLock(). Holding e.mu for a send can deadlock, including if a writer
+	// is waiting when onICMPError tries to take a second read lock.
 
 	if err := e.LastError(); err != nil {
 		return 0, err
@@ -531,6 +556,8 @@ func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tcp
 }
 
 // OnReuseAddressSet implements tcpip.SocketOptionsHandler.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) OnReuseAddressSet(v bool) {
 	e.mu.Lock()
 	e.portFlags.MostRecent = v
@@ -538,6 +565,8 @@ func (e *endpoint) OnReuseAddressSet(v bool) {
 }
 
 // OnReusePortSet implements tcpip.SocketOptionsHandler.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) OnReusePortSet(v bool) {
 	e.mu.Lock()
 	e.portFlags.LoadBalanced = v
@@ -592,6 +621,8 @@ type udpPacketInfo struct {
 }
 
 // Disconnect implements tcpip.Endpoint.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) Disconnect() tcpip.Error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -651,12 +682,17 @@ func (e *endpoint) Disconnect() tcpip.Error {
 }
 
 // Connect connects the endpoint to its peer. Specifying a NIC is optional.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) Connect(addr tcpip.FullAddress) tcpip.Error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	err := e.net.ConnectAndThen(addr, func(netProto tcpip.NetworkProtocolNumber, previousID, nextID stack.TransportEndpointID) tcpip.Error {
-		nextID.LocalPort = e.localPort
+		// ConnectAndThen invokes this callback synchronously while Connect
+		// holds e.mu. checklocks cannot propagate the captured lock into
+		// a passed callback, so only the guarded accesses and call are ignored.
+		nextID.LocalPort = e.localPort // +checklocksignore
 		nextID.RemotePort = addr.Port
 
 		// Even if we're connected, this endpoint can still be used to send
@@ -670,24 +706,24 @@ func (e *endpoint) Connect(addr tcpip.FullAddress) tcpip.Error {
 			}
 		}
 
-		oldPortFlags := e.boundPortFlags
+		oldPortFlags := e.boundPortFlags // +checklocksignore
 
 		// Remove the old registration.
-		if e.localPort != 0 {
-			previousID.LocalPort = e.localPort
-			previousID.RemotePort = e.remotePort
-			e.stack.UnregisterTransportEndpoint(e.effectiveNetProtos, ProtocolNumber, previousID, e, oldPortFlags, e.boundBindToDevice)
+		if e.localPort != 0 { // +checklocksignore
+			previousID.LocalPort = e.localPort                                                                                          // +checklocksignore
+			previousID.RemotePort = e.remotePort                                                                                        // +checklocksignore
+			e.stack.UnregisterTransportEndpoint(e.effectiveNetProtos, ProtocolNumber, previousID, e, oldPortFlags, e.boundBindToDevice) // +checklocksignore
 		}
 
-		nextID, btd, err := e.registerWithStack(netProtos, nextID)
+		nextID, btd, err := e.registerWithStack(netProtos, nextID) // +checklocksignore
 		if err != nil {
 			return err
 		}
 
-		e.localPort = nextID.LocalPort
-		e.remotePort = nextID.RemotePort
-		e.boundBindToDevice = btd
-		e.effectiveNetProtos = netProtos
+		e.localPort = nextID.LocalPort   // +checklocksignore
+		e.remotePort = nextID.RemotePort // +checklocksignore
+		e.boundBindToDevice = btd        // +checklocksignore
+		e.effectiveNetProtos = netProtos // +checklocksignore
 		return nil
 	})
 	if err != nil {
@@ -707,6 +743,8 @@ func (*endpoint) ConnectEndpoint(tcpip.Endpoint) tcpip.Error {
 
 // Shutdown closes the read and/or write end of the endpoint connection
 // to its peer.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) Shutdown(flags tcpip.ShutdownFlags) tcpip.Error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -754,6 +792,9 @@ func (*endpoint) Accept(*tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, tcpi
 	return nil, nil, &tcpip.ErrNotSupported{}
 }
 
+// registerWithStack registers id, reserving a port if needed.
+//
+// +checklocks:e.mu
 func (e *endpoint) registerWithStack(netProtos []tcpip.NetworkProtocolNumber, id stack.TransportEndpointID) (stack.TransportEndpointID, tcpip.NICID, tcpip.Error) {
 	bindToDevice := tcpip.NICID(e.ops.GetBindToDevice())
 	if e.localPort == 0 {
@@ -791,6 +832,9 @@ func (e *endpoint) registerWithStack(netProtos []tcpip.NetworkProtocolNumber, id
 	return id, bindToDevice, err
 }
 
+// bindLocked binds an initial endpoint while retaining e.mu for the caller.
+//
+// +checklocks:e.mu
 func (e *endpoint) bindLocked(addr tcpip.FullAddress) tcpip.Error {
 	// Don't allow binding once endpoint is not in the initial state
 	// anymore.
@@ -799,6 +843,10 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) tcpip.Error {
 	}
 
 	err := e.net.BindAndThen(addr, func(boundNetProto tcpip.NetworkProtocolNumber, boundAddr tcpip.Address) tcpip.Error {
+		// BindAndThen invokes this callback synchronously while bindLocked
+		// holds e.mu. checklocks cannot propagate the captured lock into
+		// a passed callback, so only the guarded accesses and call are ignored.
+
 		// Expand netProtos to include v4 and v6 if the caller is binding to a
 		// wildcard (empty) address, and this is an IPv6 endpoint with v6only
 		// set to false.
@@ -814,14 +862,14 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) tcpip.Error {
 			LocalPort:    addr.Port,
 			LocalAddress: boundAddr,
 		}
-		id, btd, err := e.registerWithStack(netProtos, id)
+		id, btd, err := e.registerWithStack(netProtos, id) // +checklocksignore
 		if err != nil {
 			return err
 		}
 
-		e.localPort = id.LocalPort
-		e.boundBindToDevice = btd
-		e.effectiveNetProtos = netProtos
+		e.localPort = id.LocalPort       // +checklocksignore
+		e.boundBindToDevice = btd        // +checklocksignore
+		e.effectiveNetProtos = netProtos // +checklocksignore
 		return nil
 	})
 	if err != nil {
@@ -836,6 +884,8 @@ func (e *endpoint) bindLocked(addr tcpip.FullAddress) tcpip.Error {
 
 // Bind binds the endpoint to a specific local address and port.
 // Specifying a NIC is optional.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) Bind(addr tcpip.FullAddress) tcpip.Error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -849,6 +899,8 @@ func (e *endpoint) Bind(addr tcpip.FullAddress) tcpip.Error {
 }
 
 // GetLocalAddress returns the address to which the endpoint is bound.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) GetLocalAddress() (tcpip.FullAddress, tcpip.Error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -859,6 +911,8 @@ func (e *endpoint) GetLocalAddress() (tcpip.FullAddress, tcpip.Error) {
 }
 
 // GetRemoteAddress returns the address to which the endpoint is connected.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) GetRemoteAddress() (tcpip.FullAddress, tcpip.Error) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -874,6 +928,8 @@ func (e *endpoint) GetRemoteAddress() (tcpip.FullAddress, tcpip.Error) {
 
 // Readiness returns the current readiness of the endpoint. For example, if
 // waiter.EventIn is set, the endpoint is immediately readable.
+//
+// +checklocksexclude:e.lastErrorMu
 func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 	var result waiter.EventMask
 
@@ -995,6 +1051,8 @@ func (e *endpoint) HandlePacket(id stack.TransportEndpointID, pkt *stack.PacketB
 	}
 }
 
+// +checklocksexclude:e.mu
+// +checklocksexclude:e.lastErrorMu
 func (e *endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, pkt *stack.PacketBuffer) {
 	// Update last error first.
 	e.lastErrorMu.Lock()
@@ -1045,6 +1103,9 @@ func (e *endpoint) onICMPError(err tcpip.Error, transErr stack.TransportError, p
 }
 
 // HandleError implements stack.TransportEndpoint.
+//
+// +checklocksexclude:e.mu
+// +checklocksexclude:e.lastErrorMu
 func (e *endpoint) HandleError(transErr stack.TransportError, pkt *stack.PacketBuffer) {
 	// TODO(gvisor.dev/issues/5270): Handle all transport errors.
 	switch transErr.Kind() {
@@ -1061,6 +1122,8 @@ func (e *endpoint) State() uint32 {
 }
 
 // Info returns a copy of the endpoint info.
+//
+// +checklocksexclude:e.mu
 func (e *endpoint) Info() tcpip.EndpointInfo {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -1084,6 +1147,11 @@ func (e *endpoint) SetOwner(owner tcpip.PacketOwner) {
 }
 
 // SocketOptions implements tcpip.Endpoint.
+//
+// Setting reuse options calls back into this endpoint and requires e.mu to be
+// unlocked. Getting or setting the last error likewise requires e.lastErrorMu
+// to be unlocked. checklocks cannot express these endpoint-specific locks
+// through the SocketOptionsHandler interface stored in the returned options.
 func (e *endpoint) SocketOptions() *tcpip.SocketOptions {
 	return &e.ops
 }
