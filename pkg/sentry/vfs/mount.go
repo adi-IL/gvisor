@@ -1019,18 +1019,20 @@ func (vfs *VirtualFilesystem) umountTreeLocked(mnt *Mount, opts *umountRecursive
 			}
 		}
 		if mnt.parent() != nil {
-			vfs.delayDecRef(mnt.getKey())
 			if vfs.shouldUmount(mnt, opts) {
-				vfs.disconnectLocked(mnt)
+				oldKey := vfs.disconnectLocked(mnt)
+				vfs.delayDecRef(oldKey)
 			} else {
 				// Restore mnt in it's parent children list with a reference, but leave
 				// it marked as unmounted. These partly unmounted mounts are cleaned up
-				// in vfs.forgetDeadMountpoints and Mount.destroy. We keep the extra
-				// reference on the mount but remove a reference on the mount point so
+				// in vfs.forgetDeadMountpoint and Mount.destroy. We keep the extra
+				// reference on the mount but remove a reference on the mount parent so
 				// that mount.Destroy is called when there are no other references on
 				// the parent.
 				mnt.IncRef()
-				mnt.parent().children[mnt] = struct{}{}
+				parent := mnt.parent()
+				parent.children[mnt] = struct{}{}
+				vfs.delayDecRef(parent)
 			}
 		}
 		vfs.setPropagation(mnt, linux.MS_PRIVATE)
@@ -1133,12 +1135,18 @@ func (vfs *VirtualFilesystem) connectLocked(mnt *Mount, vd VirtualDentry, mntns 
 //   - vfs.mountMu must be locked.
 //   - vfs.mounts.seq must be in a writer critical section.
 //   - mnt.parent() != nil.
+//
+// +checklocks:vfs.mountMu
 func (vfs *VirtualFilesystem) disconnectLocked(mnt *Mount) VirtualDentry {
 	vd := mnt.getKey()
 	if checkInvariants {
 		if vd.mount == nil {
 			panic("VFS.disconnectLocked called on disconnected mount")
 		}
+		if !vd.dentry.TryIncRef() {
+			panic("VFS.disconnectLocked called on an already-destroyed mount point")
+		}
+		vfs.delayDecRef(vd.dentry)
 		if mnt.ns.mountpoints[vd.dentry] == 0 {
 			panic("VFS.disconnectLocked called on dentry with zero mountpoints.")
 		}
@@ -1217,8 +1225,8 @@ func (mnt *Mount) destroy(ctx context.Context) {
 		mnt.vfs.mounts.seq.EndWrite()
 	}
 
-	// Cleanup any leftover children. The mount point has already been decref'd in
-	// umount so we just need to clean up the actual mounts.
+	// Cleanup any leftover children. The parent mount has already been decref'd in
+	// umount so we just need to clean up the actual mounts and mount points.
 	if len(mnt.children) != 0 {
 		mnt.vfs.mounts.seq.BeginWrite()
 		for child := range mnt.children {
@@ -1227,7 +1235,8 @@ func (mnt *Mount) destroy(ctx context.Context) {
 					panic("children of a mount that has no references should already be marked as unmounted.")
 				}
 			}
-			mnt.vfs.disconnectLocked(child)
+			childKey := mnt.vfs.disconnectLocked(child)
+			mnt.vfs.delayDecRef(childKey.dentry)
 			mnt.vfs.delayDecRef(child)
 		}
 		mnt.vfs.mounts.seq.EndWrite()
